@@ -49,6 +49,9 @@ GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # fast + free;
 FIREBASE_CRED  = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_credentials.json")
 LLM_TIMEOUT    = int(os.getenv("LLM_TIMEOUT", "15"))  # Groq is fast, no need for a 300s budget
 OWNER_WELCOME  = os.getenv("OWNER_WELCOME_MESSAGE", "")  # optional custom intro line from you, the shop owner
+RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+OWNER_CHAT_ID  = os.getenv("OWNER_CHAT_ID", "")  # your Telegram chat id, to get notified of new orders
 
 cred = credentials.Certificate(FIREBASE_CRED)
 firebase_admin.initialize_app(cred)
@@ -119,12 +122,15 @@ def search_by_field(collection: str, field: str, value: str, limit: int = 5) -> 
 
 
 _category_cache: dict = {"categories": [], "ts": 0}
+CATEGORY_BLACKLIST = {"default", "uncategorized", "none", ""}
 
 def get_categories(limit: int = 8) -> list:
     """
     Distinct product categories for the /menu buttons. Firestore has no
     native DISTINCT, so we scan and dedupe in Python, with a 5-minute cache
     so opening /menu repeatedly doesn't re-scan the whole collection.
+    Placeholder values like "Default" are skipped — they're a sign of
+    products with no real category set, not an actual section of the shop.
     """
     import time
     now = time.time()
@@ -134,7 +140,7 @@ def get_categories(limit: int = 8) -> list:
     docs = db.collection("products").limit(300).stream()
     for doc in docs:
         cat = (doc.to_dict() or {}).get("category", "").strip()
-        if cat and cat not in seen:
+        if cat and cat.lower() not in CATEGORY_BLACKLIST and cat not in seen:
             seen.add(cat)
             ordered.append(cat)
         if len(ordered) >= limit:
@@ -170,13 +176,77 @@ STOPWORDS = {
 
 
 def classify_intent(user_msg: str) -> str:
-    """Returns 'faq', 'product', or 'chitchat' — pure keyword routing, no model call."""
+    """Returns 'faq', 'product', or 'chitchat' — pure keyword routing, no model call.
+    Used as the safety-net fallback if the smart classifier below is unavailable
+    or fails — the bot never goes fully silent just because Groq is down."""
     msg = user_msg.lower()
     if any(re.search(rf"\b{re.escape(k)}\b", msg) for k in FAQ_KEYWORDS):
         return "faq"
     if any(re.search(rf"\b{re.escape(k)}\b", msg) for k in PRODUCT_KEYWORDS):
         return "product"
     return "chitchat"
+
+
+INTENT_SYSTEM_PROMPT = """You are an intent router for a bookstore Telegram bot.
+Classify the customer's message into EXACTLY one of these labels:
+
+- "buy"      — they want to purchase/order something right now, in ANY
+               phrasing or spelling: "i wanna buy", "i want to buy", "buy",
+               "i need it", "i'll take it", "lemme get this", "purchase",
+               typos like "i wana by it" — all count as "buy".
+- "product"  — browsing, searching, or asking about books: prices, ratings,
+               categories, recommendations, "show me", "do you have...".
+- "faq"      — shipping, returns, payment methods, delivery time, contact,
+               warranty, policy questions.
+- "chitchat" — greetings, small talk, anything that isn't the above.
+
+Also extract a short "query": if the message names a specific book/title/
+author/keyword, put it here (cleaned up, no filler words). If it doesn't
+name anything specific (e.g. just "buy" or "i wanna buy"), leave query "".
+
+Respond with ONLY a JSON object, nothing else, no markdown fences:
+{"intent": "buy|product|faq|chitchat", "query": "<string>"}
+"""
+
+
+def classify_intent_smart(user_msg: str) -> dict:
+    """
+    LLM-based classification. This is the ONLY thing the LLM decides here —
+    a label from a fixed set of 4, plus a search phrase echoed back from the
+    user's own words. It can't introduce new facts or skip the deterministic
+    Firebase fetch that happens afterward; it only picks which fetch to run.
+    Falls back to the keyword classifier on any failure, so a Groq outage
+    degrades the bot to "less smart routing", never "no routing".
+    """
+    fallback = {"intent": classify_intent(user_msg), "query": ""}
+    if not GROQ_API_KEY:
+        return fallback
+    try:
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0,
+                "max_tokens": 60,
+            },
+            timeout=LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
+        intent = parsed.get("intent")
+        if intent not in ("buy", "product", "faq", "chitchat"):
+            return fallback
+        return {"intent": intent, "query": (parsed.get("query") or "").strip()}
+    except Exception:
+        log.exception("Smart intent classification failed — using keyword fallback")
+        return fallback
 
 
 def extract_query_terms(user_msg: str) -> str:
@@ -197,7 +267,26 @@ def fetch_products(user_msg: str) -> list:
     if not results:
         # Broaden: maybe they asked for "all"/"everything" or query was too narrow
         results = list_collection("products", limit=8)
-    return results
+    return dedupe_products(results)
+
+
+def dedupe_products(results: list) -> list:
+    """
+    Firestore can easily end up with two docs for the same book (re-imports,
+    manual re-entry, etc). Same title + same price is treated as a duplicate
+    listing and collapsed to one, so customers don't see "The Black Maria"
+    twice in a row.
+    """
+    seen, deduped = set(), []
+    for r in results:
+        title = (r.get("title") or r.get("name") or "").strip().lower()
+        price = str(r.get("price", ""))
+        key = (title, price)
+        if title and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    return deduped
 
 
 def fetch_faqs(user_msg: str) -> list:
@@ -212,22 +301,31 @@ def fetch_faqs(user_msg: str) -> list:
 #       phrasing; if it fails or times out we silently keep the Python render.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_products(results: list) -> tuple:
-    """Deterministic formatting — this is what actually gets shown unless polish succeeds."""
-    if not results:
-        return None, []
-    lines, imgs = [], []
-    for r in results[:5]:
+def build_product_cards(results: list, limit: int = 5) -> list:
+    """
+    Deterministic, always-correct: one card per product, each with its own
+    caption AND its own image attached — this is what actually gets sent.
+    Replaces the old single-text-block + separate-photo-strip layout, which
+    made it impossible to tell which image belonged to which book.
+    """
+    cards = []
+    for r in results[:limit]:
         title = r.get("title") or r.get("name") or "Unknown"
         price = r.get("price", "N/A")
         currency = r.get("currency", "£")
-        rating = r.get("rating", "N/A")
+        rating = r.get("rating")
         category = r.get("category", "")
         img = r.get("image_url", "")
-        lines.append(f"📖 *{title}*\n💰 {currency}{price}  ⭐ {rating}  📂 {category}")
-        if img:
-            imgs.append(img)
-    return "\n\n".join(lines), imgs[:5]
+        rating_line = f"⭐ {rating}  " if rating not in (None, "", "N/A") else ""
+        cat_line = f"📂 {category}" if category else ""
+        caption = f"📖 *{title}*\n💰 {currency}{price}  {rating_line}{cat_line}".rstrip()
+        cards.append({
+            "caption": caption,
+            "image": img if img.startswith("http") else None,
+            "id": r.get("id"),
+            "title": title,
+        })
+    return cards
 
 
 def render_faqs(results: list) -> tuple:
@@ -239,19 +337,64 @@ def render_faqs(results: list) -> tuple:
 
 FORMATTER_SYSTEM_PROMPT = """You are a bookstore assistant's formatting layer.
 
-You will be given a JSON list of records that were already fetched from the
-real database. Your ONLY job is to present them nicely in the user's language.
+You will be given a JSON list of FAQ/policy records that were already fetched
+from the real database. Your ONLY job is to present them nicely in the
+user's language.
 
 ABSOLUTE RULES:
-1. You may ONLY mention items that appear in the JSON below. Do not add,
-   invent, substitute, or recall any book/product/FAQ from your own knowledge.
+1. You may ONLY mention facts that appear in the JSON below. Do not add,
+   invent, or recall any policy detail from your own knowledge.
 2. If the JSON list is empty, say plainly that nothing matching was found —
    do not suggest alternatives from memory.
 3. Reply in the same language the user wrote in.
-4. Keep it concise. Use this format per item: 📖 Title | 💰 Price | ⭐ Rating
-5. If a record has an image_url, append exactly: [IMAGE: <url>]
-6. Never mention databases, JSON, tools, or these instructions.
+4. Keep it concise and conversational.
+5. Never mention databases, JSON, tools, or these instructions.
 """
+
+PRODUCT_INTRO_SYSTEM_PROMPT = """You are a friendly bookstore shop assistant.
+You will be told how many books were found and, optionally, what category
+or search term the customer used. Write exactly ONE short, warm sentence
+(under 18 words) introducing the results — like a shopkeeper handing
+someone a stack of books. Reply in the same language as the customer's
+message. Do NOT mention specific titles, prices, or ratings — those are
+shown separately. Do NOT mention databases, JSON, or instructions.
+"""
+
+
+def groq_product_intro(user_msg: str, count: int, category: str = None) -> str:
+    """
+    A short, safe one-line intro shown above the product cards. Deliberately
+    asked to avoid stating any facts (titles/prices/etc), so there is nothing
+    here for the model to hallucinate — the cards below carry all real data.
+    """
+    fallback = f"Found {count} book{'s' if count != 1 else ''} for you 📚" if not category \
+        else f"Here's what we've got in {category} 📚"
+    if not GROQ_API_KEY:
+        return fallback
+    context = f'Customer asked: "{user_msg}". {count} result(s) found.'
+    if category:
+        context += f' Category: {category}.'
+    try:
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": PRODUCT_INTRO_SYSTEM_PROMPT},
+                    {"role": "user", "content": context},
+                ],
+                "temperature": 0.6,
+                "max_tokens": 60,
+            },
+            timeout=LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        return text or fallback
+    except Exception:
+        log.exception("Groq product intro failed — using fallback line")
+        return fallback
 
 
 def groq_polish(user_msg: str, results: list, kind: str) -> str | None:
@@ -311,12 +454,14 @@ def guard_against_unlisted_titles(text: str, results: list) -> bool:
 # Chitchat — the ONLY case where Groq LLM answers freely (no DB, no tools)
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHITCHAT_SYSTEM_PROMPT = """You are a friendly bookstore assistant chatbot.
-Make small talk, greet the user, answer general questions about yourself.
-You do NOT have access to the real product catalog in this mode — if the
-user asks about specific books, prices, stock, or policies, tell them to
-ask about it directly (e.g. "ask me to show you some books") rather than
-answering from your own knowledge. Reply in the same language as the user.
+CHITCHAT_SYSTEM_PROMPT = """You are a friendly bookstore shop assistant chatbot.
+Reply in 1-2 short sentences MAX — this is a fast-moving shop chat, not an
+essay. Do not list multiple options or ask several questions at once; ask
+at most one short follow-up if needed. You do NOT have access to the real
+product catalog in this mode — if the user asks about specific books,
+prices, stock, or policies, tell them to ask about it directly (e.g. "try
+asking me to show you some books") rather than answering from your own
+knowledge. Reply in the same language as the user.
 """
 
 
@@ -330,7 +475,7 @@ def groq_chitchat(user_msg: str, history: list) -> str:
         resp = requests.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={"model": GROQ_MODEL, "messages": messages, "temperature": 0.7},
+            json={"model": GROQ_MODEL, "messages": messages, "temperature": 0.7, "max_tokens": 80},
             timeout=LLM_TIMEOUT,
         )
         resp.raise_for_status()
@@ -350,41 +495,31 @@ def extract_images_from_text(text: str) -> tuple:
     return clean, found
 
 
-def answer_for_products(user_msg: str, results: list, empty_msg: str = None) -> tuple:
+def build_product_result(user_msg: str, results: list, category: str = None,
+                          empty_msg: str = None) -> dict:
     """
-    Shared formatting path for any list of product dicts — used by both
-    free-text search and the /menu inline-button browsing flow, so menu
-    taps get the exact same Groq-polished, guarded output as typed queries.
+    Shared path for any list of product dicts — used by both free-text
+    search and the /menu inline-button flow, so menu taps and typed queries
+    look identical. Returns {"intro": str, "cards": list} where cards is
+    empty if nothing was found (caller sends just the intro/empty message).
     """
-    text, imgs = render_products(results)
-    if text is None:
-        return (empty_msg or "I couldn't find any matching products. "
-                "Try a different keyword or category."), []
-    polished = groq_polish(user_msg, results, kind="products")
-    if polished:
-        clean, found_imgs = extract_images_from_text(polished)
-        if guard_against_unlisted_titles(clean, results):
-            return clean, (found_imgs or imgs)
-        log.warning("Polish output failed title guard — using deterministic render")
-    return text, imgs
+    if not results:
+        return {"intro": empty_msg or "I couldn't find any matching products. "
+                "Try a different keyword or category.", "cards": []}
+    results = dedupe_products(results)
+    cards = build_product_cards(results)
+    intro = groq_product_intro(user_msg, len(cards), category=category)
+    return {"intro": intro, "cards": cards}
 
 
-def build_answer(user_msg: str, history: list) -> tuple:
+def build_answer(user_msg: str, history: list, intent: str) -> tuple:
     """
-    Returns (answer_text, image_urls). This function is the single source of
-    truth for routing — Groq LLM is consulted only where explicitly wired in,
-    and never decides on its own whether to "use" the database.
+    Returns (answer_text, image_urls) for FAQ/chitchat intents. Product and
+    buy intents are handled separately in the Telegram layer below, since
+    they render as cards/buttons, not prose — this function only covers
+    the prose-style answers. `intent` is passed in (already decided by
+    classify_intent_smart upstream) so we never classify the same message twice.
     """
-    intent = classify_intent(user_msg)
-    log.info("intent='%s' for message: %r", intent, user_msg)
-
-    if intent == "product":
-        results = fetch_products(user_msg)
-        return answer_for_products(
-            user_msg, results,
-            empty_msg="I couldn't find any matching books in our catalog. Try a different keyword or category.",
-        )
-
     if intent == "faq":
         results = fetch_faqs(user_msg)
         text, imgs = render_faqs(results)
@@ -406,11 +541,104 @@ def build_answer(user_msg: str, history: list) -> tuple:
     return clean, imgs
 
 
+def resolve_buy_target(query: str, last_results: list) -> list:
+    """
+    Figures out which product(s) a 'buy' intent refers to:
+      1. If the message named something specific, search for it.
+      2. Otherwise fall back to whatever was last shown in this chat
+         (e.g. they viewed one book's price, then just said "buy").
+    Returns a list of candidate products — empty if we genuinely can't tell.
+    """
+    if query:
+        found = search_products(query, limit=5)
+        if found:
+            return found
+    return last_results or []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step 4 — Checkout (Razorpay Payment Links) + order record in Firestore
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_order_record(product: dict, chat_id, telegram_user) -> str:
+    """Always log the order attempt in Firestore first — this is the source
+    of truth for what was ordered, independent of whether Razorpay or the
+    payment step succeeds."""
+    order = {
+        "product_id": product.get("id"),
+        "title": product.get("title") or product.get("name"),
+        "price": product.get("price"),
+        "currency": product.get("currency", ""),
+        "chat_id": str(chat_id),
+        "telegram_username": getattr(telegram_user, "username", None),
+        "telegram_name": getattr(telegram_user, "full_name", None),
+        "status": "pending_payment",
+        "created_at": firestore.SERVER_TIMESTAMP,
+    }
+    ref = db.collection("orders").add(order)[1]
+    log.info("Order created: %s for product %s", ref.id, product.get("id"))
+    return ref.id
+
+
+def razorpay_create_payment_link(product: dict, order_id: str) -> str | None:
+    """
+    Creates a Razorpay-hosted payment page and returns its URL. Returns None
+    on any failure so the caller can fall back gracefully (never block the
+    customer entirely just because the payment API hiccuped).
+    """
+    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
+        return None
+    title = product.get("title") or product.get("name") or "Book"
+    try:
+        price = float(product.get("price", 0))
+    except (TypeError, ValueError):
+        price = 0
+    amount_paise = int(round(price * 100))
+    if amount_paise <= 0:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.razorpay.com/v1/payment_links",
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            json={
+                "amount": amount_paise,
+                "currency": "INR",
+                "description": title[:255],
+                "reference_id": order_id,
+                "notify": {"sms": False, "email": False},
+                "reminder_enable": False,
+            },
+            timeout=LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json().get("short_url")
+    except Exception:
+        log.exception("Razorpay payment link creation failed")
+        return None
+
+
+async def notify_owner_of_order(ctx: ContextTypes.DEFAULT_TYPE, product: dict, order_id: str,
+                                 telegram_user) -> None:
+    if not OWNER_CHAT_ID:
+        return
+    title = product.get("title") or product.get("name") or "Unknown"
+    price = product.get("price", "N/A")
+    who = f"@{telegram_user.username}" if getattr(telegram_user, "username", None) else telegram_user.full_name
+    try:
+        await ctx.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"🛎️ New order ({order_id[:6]})\n📖 {title}\n💰 {price}\n👤 {who}",
+        )
+    except Exception:
+        log.exception("Could not notify owner of new order")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Telegram handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
 histories: dict = {}
+last_shown: dict = {}  # chat_id -> last list of product dicts shown, for resolving bare "buy"
 
 def get_history(chat_id):
     return histories.setdefault(chat_id, [])
@@ -442,7 +670,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def deliver_answer(chat_id, ctx: ContextTypes.DEFAULT_TYPE, answer: str, image_urls: list,
                           reply_markup=None):
-    """Shared send logic: text (+ optional keyboard) then any product photos."""
+    """Send logic for prose answers (FAQ/chitchat): text, then any photos."""
     if not answer:
         answer = "Sorry, I couldn't find anything. Try asking about a specific book, category, or policy."
     await ctx.bot.send_message(chat_id=chat_id, text=answer, parse_mode="Markdown", reply_markup=reply_markup)
@@ -458,6 +686,50 @@ async def deliver_answer(chat_id, ctx: ContextTypes.DEFAULT_TYPE, answer: str, i
                 await ctx.bot.send_media_group(chat_id=chat_id, media=media)
         except Exception as e:
             log.warning("Could not send image(s): %s", e)
+
+
+async def deliver_products(chat_id, ctx: ContextTypes.DEFAULT_TYPE, result: dict, reply_markup=None):
+    """
+    Send a product result as a shop-style sequence: one short intro line,
+    then one message PER product with its image attached directly to that
+    product's own details, plus a "Buy Now" button so there's always a
+    single unambiguous next action. Any extra keyboard (e.g. the /menu
+    categories) goes in its own trailing message so it never collides with
+    the per-product buy buttons.
+    """
+    intro, cards = result["intro"], result["cards"]
+    await ctx.bot.send_message(chat_id=chat_id, text=intro)
+
+    if not cards:
+        if reply_markup:
+            await ctx.bot.send_message(chat_id=chat_id, text="Want to browse more?", reply_markup=reply_markup)
+        return
+
+    await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+    for card in cards:
+        buy_markup = None
+        if card.get("id"):
+            buy_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy:{card['id']}")]]
+            )
+        try:
+            if card["image"]:
+                await ctx.bot.send_photo(
+                    chat_id=chat_id, photo=card["image"], caption=card["caption"],
+                    parse_mode="Markdown", reply_markup=buy_markup,
+                )
+            else:
+                await ctx.bot.send_message(
+                    chat_id=chat_id, text=card["caption"],
+                    parse_mode="Markdown", reply_markup=buy_markup,
+                )
+        except Exception as e:
+            log.warning("Could not send product card: %s", e)
+            await ctx.bot.send_message(chat_id=chat_id, text=card["caption"],
+                                        parse_mode="Markdown", reply_markup=buy_markup)
+
+    if reply_markup:
+        await ctx.bot.send_message(chat_id=chat_id, text="Want to browse more?", reply_markup=reply_markup)
 
 
 def build_menu_keyboard() -> InlineKeyboardMarkup:
@@ -485,31 +757,36 @@ async def on_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    keyboard = await asyncio.to_thread(build_menu_keyboard)
 
     if data == "show_all":
         results = await asyncio.to_thread(list_collection, "products", 8)
-        answer, imgs = await asyncio.to_thread(
-            answer_for_products, "show all products", results,
+        last_shown[chat_id] = results
+        result = await asyncio.to_thread(
+            build_product_result, "show all products", results, None,
             "We don't have any products listed yet — check back soon!",
         )
+        await deliver_products(chat_id, ctx, result, reply_markup=keyboard)
+
     elif data == "faq":
         results = await asyncio.to_thread(fetch_faqs, "shipping returns payment policy")
-        text, imgs = render_faqs(results)
+        text, _ = render_faqs(results)
         answer = text or "Ask me about shipping, returns, payment, or contact info anytime!"
+        await deliver_answer(chat_id, ctx, answer, [], reply_markup=keyboard)
+
     elif data.startswith("cat:"):
         category = data.split(":", 1)[1]
         results = await asyncio.to_thread(search_by_field, "products", "category", category, 8)
-        answer, imgs = await asyncio.to_thread(
-            answer_for_products, f"products in category {category}", results,
+        last_shown[chat_id] = results
+        result = await asyncio.to_thread(
+            build_product_result, f"products in category {category}", results, category,
             f"No products found in *{category}* right now.",
         )
-    else:
-        answer, imgs = "Not sure what you picked — try /menu again.", []
+        await deliver_products(chat_id, ctx, result, reply_markup=keyboard)
 
-    # Re-show the menu keyboard at the bottom so browsing feels continuous,
-    # like flipping through sections of a shop rather than a one-shot answer.
-    keyboard = await asyncio.to_thread(build_menu_keyboard)
-    await deliver_answer(chat_id, ctx, answer, imgs, reply_markup=keyboard)
+    else:
+        await deliver_answer(chat_id, ctx, "Not sure what you picked — try /menu again.", [],
+                              reply_markup=keyboard)
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -520,17 +797,91 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     history = get_history(chat_id)
+    classification = await asyncio.to_thread(classify_intent_smart, user_msg)
+    intent, query = classification["intent"], classification["query"]
+    log.info("intent='%s' query='%s' for message: %r", intent, query, user_msg)
 
     try:
-        answer, image_urls = await asyncio.to_thread(build_answer, user_msg, history)
+        if intent == "product":
+            results = await asyncio.to_thread(fetch_products, query or user_msg)
+            last_shown[chat_id] = results
+            result = await asyncio.to_thread(
+                build_product_result, user_msg, results, None,
+                "I couldn't find any matching books in our catalog. Try a different keyword or category.",
+            )
+            update_history(chat_id, "user", user_msg)
+            update_history(chat_id, "assistant", result["intro"])
+            await deliver_products(chat_id, ctx, result)
+            return
+
+        if intent == "buy":
+            candidates = await asyncio.to_thread(resolve_buy_target, query, last_shown.get(chat_id))
+            update_history(chat_id, "user", user_msg)
+            if not candidates:
+                msg = "Which book would you like to buy? Tell me the title, or browse with /menu 🛍️"
+                update_history(chat_id, "assistant", msg)
+                await deliver_answer(chat_id, ctx, msg, [])
+                return
+            last_shown[chat_id] = candidates
+            cards = await asyncio.to_thread(build_product_cards, candidates)
+            intro = ("Tap *Buy Now* on the one you want 👇" if len(cards) > 1
+                      else "Great choice — tap *Buy Now* to continue 👇")
+            update_history(chat_id, "assistant", intro)
+            await deliver_products(chat_id, ctx, {"intro": intro, "cards": cards})
+            return
+
+        answer, image_urls = await asyncio.to_thread(build_answer, user_msg, history, intent)
     except Exception:
-        log.exception("build_answer failed")
+        log.exception("Answer pipeline failed")
         answer, image_urls = "Sorry, something went wrong. Please try again.", []
 
     update_history(chat_id, "user", user_msg)
     update_history(chat_id, "assistant", answer)
 
     await deliver_answer(chat_id, ctx, answer, image_urls)
+
+
+async def on_buy_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles a 'Buy Now' tap: logs the order in Firestore, creates a Razorpay
+    payment link for the exact item/price, and sends it as a Pay Now button.
+    Falls back to a manual-order message if Razorpay isn't configured or the
+    API call fails — the order is still recorded either way.
+    """
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    doc_id = query.data.split(":", 1)[1]
+
+    product = await asyncio.to_thread(get_document, "products", doc_id)
+    if product.get("error"):
+        await ctx.bot.send_message(chat_id=chat_id, text="Sorry, that item isn't available anymore.")
+        return
+
+    title = product.get("title") or product.get("name") or "this item"
+    price = product.get("price", "N/A")
+    currency = product.get("currency", "£")
+
+    order_id = await asyncio.to_thread(create_order_record, product, chat_id, query.from_user)
+    pay_url = await asyncio.to_thread(razorpay_create_payment_link, product, order_id)
+    await notify_owner_of_order(ctx, product, order_id, query.from_user)
+
+    if pay_url:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now", url=pay_url)]])
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=f"🛒 *{title}* — {currency}{price}\n\nTap below to complete payment securely:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    else:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(f"🛒 *{title}* — {currency}{price}\n\n"
+                  f"Your order ({order_id[:6]}) is logged! Online payment isn't set up yet — "
+                  "we'll reach out shortly to arrange payment and delivery."),
+            parse_mode="Markdown",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -544,6 +895,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CallbackQueryHandler(on_buy_button, pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(on_menu_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot started — model=%s (formatting-only, Groq) timeout=%ds", GROQ_MODEL, LLM_TIMEOUT)
