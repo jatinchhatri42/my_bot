@@ -46,14 +46,43 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GROQ_URL       = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # fast + free; use llama-3.3-70b-versatile for smarter phrasing
-FIREBASE_CRED  = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_credentials.json")
+FIREBASE_CRED_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_credentials.json")
+FIREBASE_CRED_JSON  = os.getenv("FIREBASE_CREDENTIALS_JSON", "")  # full key file content, for hosted envs (Railway etc.)
 LLM_TIMEOUT    = int(os.getenv("LLM_TIMEOUT", "15"))  # Groq is fast, no need for a 300s budget
 OWNER_WELCOME  = os.getenv("OWNER_WELCOME_MESSAGE", "")  # optional custom intro line from you, the shop owner
 RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 OWNER_CHAT_ID  = os.getenv("OWNER_CHAT_ID", "")  # your Telegram chat id, to get notified of new orders
 
-cred = credentials.Certificate(FIREBASE_CRED)
+
+def load_firebase_credentials():
+    """
+    Hosted platforms like Railway only have what's in your git repo — a local
+    firebase_credentials.json you never committed (correctly, since it's a
+    secret) simply won't exist there. So: prefer FIREBASE_CREDENTIALS_JSON
+    (the full key file content pasted into an env var) when present, and
+    fall back to a file on disk for local development. Fails with one clear
+    message instead of crash-looping on the same traceback forever.
+    """
+    if FIREBASE_CRED_JSON:
+        try:
+            return credentials.Certificate(json.loads(FIREBASE_CRED_JSON))
+        except json.JSONDecodeError as e:
+            raise SystemExit(
+                f"FIREBASE_CREDENTIALS_JSON is set but isn't valid JSON ({e}). "
+                "Paste the ENTIRE contents of your serviceAccountKey.json file as the value."
+            )
+    if os.path.exists(FIREBASE_CRED_PATH):
+        return credentials.Certificate(FIREBASE_CRED_PATH)
+    raise SystemExit(
+        f"No Firebase credentials found. Either set FIREBASE_CREDENTIALS_JSON "
+        f"(paste the full service account JSON as one env var — required on "
+        f"Railway/hosted platforms), or place the key file at "
+        f"'{FIREBASE_CRED_PATH}' for local development."
+    )
+
+
+cred = load_firebase_credentials()
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
